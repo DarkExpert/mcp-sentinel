@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/McpSentinel.DemoServer/McpSentinel.DemoServer.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/McpSentinel.Core/McpSentinel.Core.csproj" />
+    <Project Path="src/McpSentinel.Gateway/McpSentinel.Gateway.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/McpSentinel.Tests/McpSentinel.Tests.csproj" />
+  </Folder>
+</Solution>

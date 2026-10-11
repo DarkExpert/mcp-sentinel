@@ -1,0 +1,8 @@
+{
+  "defaultAction": "Deny",
+  "rules": [
+    { "toolName": "customer.read", "action": "Allow" },
+    { "toolName": "customer.delete", "action": "Deny" },
+    { "toolName": "invoice.refund", "action": "RequireApproval" }
+  ]
+}
