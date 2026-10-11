@@ -67,25 +67,68 @@ public static class GatewayHost
                 })
                 .WithCallToolHandler(async (request, token) =>
                 {
-                    token.ThrowIfCancellationRequested();
                     var parameters = request.Params;
                     var decision = engine.Evaluate(parameters?.Name);
-                    if (decision.Action != PolicyAction.Allow)
-                        return Error(decision.Action == PolicyAction.RequireApproval
-                            ? "Approval required. Execution blocked; approval workflow is unavailable."
-                            : "Tool execution denied by policy.");
-                    if (parameters is null || !toolNames.Contains(parameters.Name))
-                        return Error("Tool is not in the validated upstream catalog.");
-
-                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-                    timeout.CancelAfter(OperationTimeout);
-                    // Forward only name/arguments. Client metadata and task/progress requests are not relayed.
-                    var result = await connection.CallToolAsync(new CallToolRequestParams
+                    var audit = SecurityAudit.Create(request.Services!, parameters?.Name, decision.Action);
+                    audit.RecordDecision();
+                    var enforcement = "NotForwarded";
+                    var upstreamStatus = "NotAttempted";
+                    string? errorCategory = null;
+                    CancellationToken operationToken = default;
+                    try
                     {
-                        Name = parameters.Name,
-                        Arguments = parameters.Arguments
-                    }, timeout.Token);
-                    return AdaptResult(result, request.Server.NegotiatedProtocolVersion);
+                        token.ThrowIfCancellationRequested();
+                        if (decision.Action != PolicyAction.Allow)
+                        {
+                            enforcement = "Blocked";
+                            errorCategory = decision.Action == PolicyAction.RequireApproval ? "ApprovalUnavailable" : "PolicyDenied";
+                            return Error(decision.Action == PolicyAction.RequireApproval
+                                ? "Approval required. Execution blocked; approval workflow is unavailable."
+                                : "Tool execution denied by policy.");
+                        }
+                        if (parameters is null || !toolNames.Contains(parameters.Name))
+                        {
+                            enforcement = "Blocked";
+                            errorCategory = "UnknownUpstreamTool";
+                            return Error("Tool is not in the validated upstream catalog.");
+                        }
+
+                        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        timeout.CancelAfter(OperationTimeout);
+                        operationToken = timeout.Token;
+                        enforcement = "Forwarded";
+                        upstreamStatus = "Unknown";
+                        // SDK continuation may dispatch multiple upstream requests within this operation.
+                        var result = await connection.CallToolAsync(new CallToolRequestParams
+                        {
+                            Name = parameters.Name,
+                            Arguments = parameters.Arguments
+                        }, timeout.Token);
+                        var adapted = AdaptResult(result, request.Server.NegotiatedProtocolVersion);
+                        upstreamStatus = result.IsError == true ? "ToolError" : "Succeeded";
+                        errorCategory = result.IsError == true ? "UpstreamToolError" : null;
+                        return adapted;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        errorCategory = !token.IsCancellationRequested && operationToken.IsCancellationRequested ? "Timeout" : "Canceled";
+                        throw;
+                    }
+                    catch (Exception exception)
+                    {
+                        errorCategory = exception switch
+                        {
+                            HttpRequestException => "TransportError",
+                            McpProtocolException => "ProtocolError",
+                            McpException => "SdkError",
+                            _ => "InternalError"
+                        };
+                        throw;
+                    }
+                    finally
+                    {
+                        audit.RecordCompletion(enforcement, upstreamStatus, errorCategory);
+                    }
                 });
             var app = builder.Build();
             _ = app.Services.GetRequiredService<HttpClientTransport>();

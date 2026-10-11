@@ -20,6 +20,161 @@ namespace McpSentinel.Tests;
 public sealed class GatewayProtocolTests
 {
     [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task AuditFailuresPreserveSuccessfulToolResults(bool failDecision, bool failCompletion)
+    {
+        var provider = new FaultingAuditProvider(failDecision, failCompletion);
+        var invocations = 0;
+        await using var hosts = await ProtocolHosts.StartAsync("2025-06-18", (_, _) =>
+        {
+            Interlocked.Increment(ref invocations);
+            return ValueTask.FromResult(new CallToolResult
+            {
+                IsError = false, Content = [new TextContentBlock { Text = "PRIVATE_RESPONSE_CONTENT" }],
+                StructuredContent = JsonSerializer.SerializeToElement(new { value = 42 }),
+                Meta = new JsonObject { ["preserved"] = true }
+            });
+        }, provider);
+        var result = await hosts.Client.CallToolAsync("customer.read", new Dictionary<string, object?>
+        {
+            ["credential"] = "PRIVATE_ARGUMENT"
+        }, cancellationToken: hosts.Token);
+        Assert.False(result.IsError == true);
+        Assert.Equal("PRIVATE_RESPONSE_CONTENT", Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text);
+        Assert.Equal(42, result.StructuredContent!.Value.GetProperty("value").GetInt32());
+        Assert.True(result.Meta!["preserved"]!.GetValue<bool>());
+        Assert.Equal(1, invocations);
+        AssertAuditAttemptsAndRedaction(hosts, provider);
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task AuditFailuresPreserveOriginalUpstreamProtocolException(bool failDecision, bool failCompletion)
+    {
+        // Compare the real two-hop SDK error with a healthy-audit baseline; each hop
+        // decorates remote exception messages, so raw upstream text is not the wire message.
+        await using var baselineHosts = await ProtocolHosts.StartAsync("2025-06-18", (_, _) =>
+            throw new McpProtocolException("Original upstream failure", McpErrorCode.InvalidParams));
+        var baseline = await Assert.ThrowsAsync<McpProtocolException>(() => baselineHosts.Client.CallToolAsync(
+            "customer.read", cancellationToken: baselineHosts.Token).AsTask());
+        Assert.Contains("Original upstream failure", baseline.Message);
+        var provider = new FaultingAuditProvider(failDecision, failCompletion);
+        var invocations = 0;
+        await using var hosts = await ProtocolHosts.StartAsync("2025-06-18", (_, _) =>
+        {
+            Interlocked.Increment(ref invocations);
+            throw new McpProtocolException("Original upstream failure", McpErrorCode.InvalidParams);
+        }, provider);
+        var exception = await Assert.ThrowsAsync<McpProtocolException>(() => hosts.Client.CallToolAsync(
+            "customer.read", new Dictionary<string, object?> { ["credential"] = "PRIVATE_ARGUMENT" }, cancellationToken: hosts.Token).AsTask());
+        Assert.Equal(McpErrorCode.InvalidParams, exception.ErrorCode);
+        Assert.Equal(baseline.Message, exception.Message);
+        Assert.DoesNotContain(FaultingAuditProvider.Secret, exception.ToString());
+        Assert.Equal(1, invocations);
+        AssertAuditAttemptsAndRedaction(hosts, provider);
+    }
+
+    [Theory]
+    [InlineData("customer.delete", "denied by policy")]
+    [InlineData("invoice.refund", "Approval required")]
+    [InlineData("unknown", "denied by policy")]
+    public async Task AuditFailuresNeverForwardBlockedTools(string tool, string expectedMessage)
+    {
+        var provider = new FaultingAuditProvider(true, true);
+        var invocations = 0;
+        await using var hosts = await ProtocolHosts.StartAsync("2025-06-18", (_, _) =>
+        {
+            Interlocked.Increment(ref invocations);
+            return ValueTask.FromResult(new CallToolResult());
+        }, provider);
+        var result = await hosts.Client.CallToolAsync(tool, new Dictionary<string, object?> { ["credential"] = "PRIVATE_ARGUMENT" }, cancellationToken: hosts.Token);
+        Assert.True(result.IsError);
+        Assert.Contains(expectedMessage, Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text);
+        Assert.Equal(0, invocations);
+        AssertAuditAttemptsAndRedaction(hosts, provider);
+    }
+
+    [Fact]
+    public async Task AuditFailuresPreserveToolErrorResults()
+    {
+        var provider = new FaultingAuditProvider(true, true);
+        var invocations = 0;
+        await using var hosts = await ProtocolHosts.StartAsync("2025-06-18", (_, _) =>
+        {
+            Interlocked.Increment(ref invocations);
+            return ValueTask.FromResult(new CallToolResult
+            {
+                IsError = true, Content = [new TextContentBlock { Text = "PRIVATE_RESPONSE_CONTENT" }]
+            });
+        }, provider);
+        var result = await hosts.Client.CallToolAsync("customer.read", cancellationToken: hosts.Token);
+        Assert.True(result.IsError);
+        Assert.Equal("PRIVATE_RESPONSE_CONTENT", Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text);
+        Assert.Equal(1, invocations);
+        AssertAuditAttemptsAndRedaction(hosts, provider);
+    }
+
+    [Fact]
+    public async Task AuditFailuresDoNotSuppressCancellation()
+    {
+        var provider = new FaultingAuditProvider(true, true);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var invocations = 0;
+        await using var hosts = await ProtocolHosts.StartAsync("2025-06-18", async (_, token) =>
+        {
+            Interlocked.Increment(ref invocations);
+            started.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            throw new InvalidOperationException("Canceled upstream must not complete.");
+        }, provider);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(hosts.Token);
+        var call = hosts.Client.CallToolAsync("customer.read", cancellationToken: cancellation.Token).AsTask();
+        await started.Task.WaitAsync(hosts.Token);
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call);
+        await hosts.Audit.Completion.WaitAsync(hosts.Token);
+        await provider.CompletionAttempt.WaitAsync(hosts.Token);
+        Assert.Equal(1, invocations);
+        AssertAuditAttemptsAndRedaction(hosts, provider);
+    }
+
+    [Fact]
+    public async Task AuditLoggerResolutionFailureDoesNotAbortExecution()
+    {
+        var provider = new FaultingAuditProvider(false, false, failResolution: true);
+        var invocations = 0;
+        await using var hosts = await ProtocolHosts.StartAsync("2025-06-18", (_, _) =>
+        {
+            Interlocked.Increment(ref invocations);
+            return ValueTask.FromResult(new CallToolResult { IsError = false });
+        }, provider);
+        var result = await hosts.Client.CallToolAsync("customer.read", cancellationToken: hosts.Token);
+        Assert.False(result.IsError == true);
+        Assert.Equal(1, invocations);
+        Assert.Equal(1, provider.ResolutionAttempts);
+        Assert.DoesNotContain(FaultingAuditProvider.Secret, JsonSerializer.Serialize(hosts.Capture.Responses));
+    }
+
+    private static void AssertAuditAttemptsAndRedaction(ProtocolHosts hosts, FaultingAuditProvider provider)
+    {
+        Assert.Equal(1, hosts.DownstreamHandlerEntries);
+        Assert.Equal(1, provider.DecisionAttempts);
+        Assert.Equal(1, provider.CompletionAttempts);
+        Assert.Single(hosts.Audit.Entries, entry => entry.EventId == 1000);
+        Assert.Single(hosts.Audit.Entries, entry => entry.EventId == 1001);
+        var auditJson = JsonSerializer.Serialize(hosts.Audit.Entries);
+        foreach (var secret in new[] { FaultingAuditProvider.Secret, "PRIVATE_ARGUMENT", "PRIVATE_RESPONSE_CONTENT" })
+            Assert.DoesNotContain(secret, auditJson);
+        var wire = JsonSerializer.Serialize(hosts.Capture.Responses);
+        Assert.DoesNotContain(FaultingAuditProvider.Secret, wire);
+        Assert.DoesNotContain("PRIVATE_ARGUMENT", wire);
+        Assert.DoesNotContain("StackTrace", wire);
+    }
+
+    [Theory]
     [InlineData("2024-11-05", false)]
     [InlineData("2024-11-05", true)]
     [InlineData("2025-03-26", false)]
@@ -102,6 +257,7 @@ public sealed class GatewayProtocolTests
         var result = await hosts.Client.CallToolAsync(tool, cancellationToken: hosts.Token);
         Assert.Equal(expectedInvocations, invocations);
         Assert.Equal(1, hosts.DownstreamHandlerEntries);
+        Assert.Single(hosts.Audit.Entries, entry => entry.EventId == 1001);
         if (expectedInvocations == 0) Assert.True(result.IsError);
         else
         {
@@ -123,6 +279,9 @@ public sealed class GatewayProtocolTests
         Assert.True(result.IsError);
         Assert.Equal(11, invocations); // Initial dispatch plus SDK 2.2.0's ten continuation retries.
         Assert.Equal(1, hosts.DownstreamHandlerEntries);
+        var audit = Assert.Single(hosts.Audit.Entries, entry => entry.EventId == 1001);
+        Assert.Equal("Unknown", audit.Fields["UpstreamStatus"]);
+        Assert.Equal("SdkError", audit.Fields["ErrorCategory"]);
     }
 
     [Fact]
@@ -177,9 +336,10 @@ public sealed class GatewayProtocolTests
         public int DownstreamHandlerEntries => Volatile.Read(ref handlerEntries);
         public CancellationToken Token => budget.Token;
         public WireCapture Capture { get; } = new();
+        public AuditLogCollector Audit { get; } = new();
         public McpClient Client { get; private set; } = null!;
 
-        public static async Task<ProtocolHosts> StartAsync(string version, McpRequestHandler<CallToolRequestParams, CallToolResult> handler)
+        public static async Task<ProtocolHosts> StartAsync(string version, McpRequestHandler<CallToolRequestParams, CallToolResult> handler, ILoggerProvider? auditProvider = null)
         {
             var hosts = new ProtocolHosts();
             try
@@ -199,6 +359,8 @@ public sealed class GatewayProtocolTests
                 hosts.upstream.MapMcp("/mcp");
                 await hosts.upstream.StartAsync(hosts.Token);
                 var gatewayBuilder = Builder();
+                gatewayBuilder.Logging.AddProvider(hosts.Audit);
+                if (auditProvider is not null) gatewayBuilder.Logging.AddProvider(auditProvider);
                 gatewayBuilder.Configuration["Gateway:UpstreamUrl"] = Assert.Single(hosts.upstream.Urls) + "/mcp";
                 gatewayBuilder.Configuration["Gateway:PolicyPath"] = Path.Combine(AppContext.BaseDirectory, "policies", "demo-policy.json");
                 // Counts downstream entries without replacing Gateway policy or forwarding handlers.

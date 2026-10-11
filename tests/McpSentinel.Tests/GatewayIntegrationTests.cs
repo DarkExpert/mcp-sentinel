@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Globalization;
 using McpSentinel.DemoServer;
 using McpSentinel.Gateway;
 using Microsoft.AspNetCore.Builder;
@@ -15,6 +16,64 @@ namespace McpSentinel.Tests;
 
 public sealed class GatewayIntegrationTests
 {
+    [Theory]
+    [InlineData("customer.read", "Allow", "Forwarded", "Succeeded", null)]
+    [InlineData("customer.delete", "Deny", "Blocked", "NotAttempted", "PolicyDenied")]
+    [InlineData("invoice.refund", "RequireApproval", "Blocked", "NotAttempted", "ApprovalUnavailable")]
+    [InlineData("unknown", "Deny", "Blocked", "NotAttempted", "PolicyDenied")]
+    public async Task AuditSeparatesDecisionAndOneTerminalOutcome(string tool, string decision, string enforcement, string status, string? error)
+    {
+        await using var hosts = await Hosts.StartAsync();
+        await hosts.Client.CallToolAsync(tool, new Dictionary<string, object?>
+        {
+            ["customerId"] = "customer-1", ["invoiceId"] = "invoice-1", ["credential"] = "ARGUMENT_SECRET_MARKER"
+        }, cancellationToken: hosts.Token);
+        var evaluated = Assert.Single(hosts.Audit.Entries, entry => entry.EventId == 1000);
+        var completed = Assert.Single(hosts.Audit.Entries, entry => entry.EventId == 1001);
+        Assert.Equal(2, hosts.Audit.Entries.Count);
+        Assert.Equal(evaluated.Fields["CorrelationId"], completed.Fields["CorrelationId"]);
+        Assert.True(Guid.TryParseExact((string)completed.Fields["CorrelationId"]!, "N", out _));
+        Assert.Equal(tool, completed.Fields["ToolName"]);
+        Assert.Equal(decision, evaluated.Fields["PolicyDecision"]);
+        Assert.Equal(decision, completed.Fields["PolicyDecision"]);
+        Assert.Equal(enforcement, completed.Fields["EnforcementOutcome"]);
+        Assert.Equal(status, completed.Fields["UpstreamStatus"]);
+        Assert.Equal(error, completed.Fields["ErrorCategory"]);
+        Assert.True((double)completed.Fields["DurationMs"]! >= 0);
+        foreach (var entry in hosts.Audit.Entries)
+        {
+            Assert.True(DateTimeOffset.TryParseExact(Assert.IsType<string>(entry.Fields["TimestampUtc"]), "O",
+                CultureInfo.InvariantCulture, DateTimeStyles.None, out var timestamp));
+            Assert.Equal(TimeSpan.Zero, timestamp.Offset);
+            Assert.Null(entry.Exception);
+            var serialized = JsonSerializer.Serialize(entry);
+            foreach (var sensitive in new[] { "ARGUMENT_SECRET_MARKER", "customer-1", "invoice-1", "Ada Example", "credential" })
+                Assert.DoesNotContain(sensitive, serialized);
+        }
+        Assert.Equal(tool == "customer.read" ? 1 : 0, hosts.Tools.InvocationCount("customer.read"));
+        Assert.Equal(0, hosts.Tools.InvocationCount("customer.delete"));
+        Assert.Equal(0, hosts.Tools.InvocationCount("invoice.refund"));
+    }
+
+    [Fact]
+    public async Task AuditUsesDistinctCorrelationIdsAndMarksToolErrorsWithoutTheirContent()
+    {
+        await using var hosts = await Hosts.StartAsync();
+        for (var i = 0; i < 2; i++)
+            await hosts.Client.CallToolAsync("customer.read", new Dictionary<string, object?> { ["customerId"] = "missing-secret-customer" }, cancellationToken: hosts.Token);
+        var completed = hosts.Audit.Entries.Where(entry => entry.EventId == 1001).ToArray();
+        Assert.Equal(2, completed.Length);
+        Assert.NotEqual(completed[0].Fields["CorrelationId"], completed[1].Fields["CorrelationId"]);
+        foreach (var entry in completed)
+        {
+            Assert.Equal("Forwarded", entry.Fields["EnforcementOutcome"]);
+            Assert.Equal("ToolError", entry.Fields["UpstreamStatus"]);
+            Assert.Equal("UpstreamToolError", entry.Fields["ErrorCategory"]);
+        }
+        Assert.DoesNotContain("Customer not found", JsonSerializer.Serialize(hosts.Audit.Entries));
+        Assert.DoesNotContain("missing-secret-customer", JsonSerializer.Serialize(hosts.Audit.Entries));
+    }
+
     [Fact]
     public async Task InitializationAndDiscoveryPreserveUpstreamMetadata()
     {
@@ -100,6 +159,11 @@ public sealed class GatewayIntegrationTests
         if (exception is not null)
             Assert.IsAssignableFrom<McpException>(exception);
         Assert.Equal(0, hosts.Tools.InvocationCount("customer.read"));
+        var audit = Assert.Single(hosts.Audit.Entries, entry => entry.EventId == 1001);
+        Assert.Equal("Forwarded", audit.Fields["EnforcementOutcome"]);
+        Assert.Equal("Unknown", audit.Fields["UpstreamStatus"]);
+        Assert.Equal("TransportError", audit.Fields["ErrorCategory"]);
+        Assert.Null(audit.Exception);
     }
 
     [Theory]
@@ -219,7 +283,10 @@ public sealed class GatewayIntegrationTests
         upstream.MapMcp("/mcp");
         using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         await upstream.StartAsync(budget.Token);
-        await using var gateway = await GatewayHost.BuildAsync(GatewayBuilder(Endpoint(upstream)), budget.Token);
+        var auditCollector = new AuditLogCollector();
+        var gatewayBuilder = GatewayBuilder(Endpoint(upstream));
+        gatewayBuilder.Logging.AddProvider(auditCollector);
+        await using var gateway = await GatewayHost.BuildAsync(gatewayBuilder, budget.Token);
         await gateway.StartAsync(budget.Token);
         await using var transport = new HttpClientTransport(new HttpClientTransportOptions
         {
@@ -245,6 +312,12 @@ public sealed class GatewayIntegrationTests
         // Wait on a deterministic signal from the executing upstream handler, never a sleep.
         await canceled.Task.WaitAsync(budget.Token);
         Assert.Equal(1, Volatile.Read(ref invocations));
+        await auditCollector.Completion.WaitAsync(budget.Token);
+        var audit = Assert.Single(auditCollector.Entries, entry => entry.EventId == 1001);
+        Assert.Equal("Forwarded", audit.Fields["EnforcementOutcome"]);
+        Assert.Equal("Unknown", audit.Fields["UpstreamStatus"]);
+        Assert.Equal(useTimeout ? "Timeout" : "Canceled", audit.Fields["ErrorCategory"]);
+        Assert.Null(audit.Exception);
         await gateway.StopAsync(budget.Token);
         await upstream.StopAsync(budget.Token);
     }
@@ -278,6 +351,7 @@ public sealed class GatewayIntegrationTests
         private HttpClientTransport? transport;
         public McpClient Client { get; private set; } = null!;
         public DemoTools Tools => Demo.Services.GetRequiredService<DemoTools>();
+        public AuditLogCollector Audit { get; } = new();
 
         public static async Task<Hosts> StartAsync(string? policyPath = null)
         {
@@ -287,6 +361,7 @@ public sealed class GatewayIntegrationTests
                 hosts.Demo = DemoServerHost.Build(CreateBuilder());
                 await hosts.Demo.StartAsync(hosts.Token);
                 var gatewayBuilder = GatewayBuilder(Endpoint(hosts.Demo));
+                gatewayBuilder.Logging.AddProvider(hosts.Audit);
                 if (policyPath is not null) gatewayBuilder.Configuration["Gateway:PolicyPath"] = policyPath;
                 hosts.gateway = await GatewayHost.BuildAsync(gatewayBuilder, hosts.Token);
                 await hosts.gateway.StartAsync(hosts.Token);
